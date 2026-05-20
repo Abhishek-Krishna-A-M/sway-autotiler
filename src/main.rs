@@ -8,63 +8,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_conn = Connection::new()?;
     let events = event_conn.subscribe([EventType::Window])?;
 
-    println!("Sway Autotiler started. Super-optimized zero-allocation version.");
+    println!("Sway Autotiler started. Super-optimized live-geometry version.");
 
     for event in events {
         match event {
             Ok(Event::Window(w)) => {
-                // We only care when a window gets focused
-                if w.change == WindowChange::Focus {
-                    let rect = w.container.rect;
+                // FIX: Listen to BOTH Focus changes and Floating toggles so the 
+                // script catches the exact moment a window becomes tiled.
+                if w.change == WindowChange::Focus || w.change == WindowChange::Floating {
                     
-                    // Ultra-fast floating check using native Rust Enum matching (No string allocation)
-                    let is_floating = w.container.node_type == swayipc::NodeType::FloatingCon 
-                        || matches!(
-                            w.container.floating,
-                            Some(Floating::UserOn) | Some(Floating::AutoOn)
-                        );
-                    
-                    if is_floating {
-                        continue;
-                    }
-
-                    let mut is_tabbed_or_stacked = false;
-                    let mut already_split_correctly = false;
-
-                    // Determine split direction based on current window dimensions.
-                    let target_cmd = if rect.width > rect.height { "split h" } else { "split v" };
-
-                    // Fetch tree to check parent layout to prevent ruining tabbed/stacked layouts
-                    // and to avoid infinite redundant nesting.
+                    // FIX: Always pull a fresh tree here. This reads the window geometry 
+                    // AFTER Sway recalculates it into the tiling grid, bypassing the race condition.
                     if let Ok(tree) = cmd_conn.get_tree() {
-                        if let Some((_, Some(parent))) = get_focused_node_and_parent(&tree, None) {
+                        if let Some((focused_node, Some(parent))) = get_focused_node_and_parent(&tree, None) {
                             
+                            // Ultra-fast floating check using native Rust Enum matching (Zero string allocation)
+                            let is_floating = focused_node.node_type == swayipc::NodeType::FloatingCon 
+                                || matches!(
+                                    focused_node.floating,
+                                    Some(Floating::UserOn) | Some(Floating::AutoOn)
+                                );
+                            
+                            if is_floating {
+                                continue;
+                            }
+
                             // Native Enum matching for layouts (Zero memory allocation)
-                            is_tabbed_or_stacked = matches!(
+                            let is_tabbed_or_stacked = matches!(
                                 parent.layout, 
                                 NodeLayout::Tabbed | NodeLayout::Stacked
                             );
 
+                            // If we're inside a tabbed or stacked container, don't mess up the layout
+                            if is_tabbed_or_stacked {
+                                continue;
+                            }
+
+                            // FIX: Use the live rect from the tree loop, NOT the stale w.container.rect
+                            let rect = focused_node.rect;
+                            
+                            // Determine split direction based on current real window dimensions.
+                            let target_cmd = if rect.width > rect.height { "split h" } else { "split v" };
+
                             // Check if parent is ALREADY split in our target direction
-                            already_split_correctly = match target_cmd {
+                            let already_split_correctly = match target_cmd {
                                 "split h" => parent.layout == NodeLayout::SplitH,
                                 "split v" => parent.layout == NodeLayout::SplitV,
                                 _ => false,
                             };
-                        }
-                    }
 
-                    // If we're inside a tabbed or stacked container, don't mess up the layout
-                    if is_tabbed_or_stacked {
-                        continue;
-                    }
-
-                    // Only send the split command if the parent layout isn't ALREADY 
-                    // split in the target direction. This stops infinite container nesting!
-                    if !already_split_correctly {
-                        if let Err(e) = cmd_conn.run_command(target_cmd) {
-                            eprintln!("Failed to execute command '{}': {}", target_cmd, e);
-                            break;
+                            // Only send the split command if the parent layout isn't ALREADY 
+                            // split in the target direction. This stops infinite container nesting!
+                            if !already_split_correctly {
+                                if let Err(e) = cmd_conn.run_command(target_cmd) {
+                                    eprintln!("Failed to execute command '{}': {}", target_cmd, e);
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
