@@ -6,26 +6,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Connection 2: To subscribe to the event stream
     let mut event_conn = Connection::new()?;
-    let events = event_conn.subscribe([EventType::Window])?;
+    
+    // FIX: Listen to Focus, Floating, Move, and New events to capture every part of a window's life cycle
+    let events = event_conn.subscribe([
+        EventType::Window
+    ])?;
 
-    println!("Sway Autotiler started. Super-optimized live-geometry version.");
+    println!("Sway Autotiler started. Targeted ID-engine active.");
 
     for event in events {
         match event {
             Ok(Event::Window(w)) => {
-                // FIX: Listen to BOTH Focus changes and Floating toggles so the 
-                // script catches the exact moment a window becomes tiled.
-                if w.change == WindowChange::Focus || w.change == WindowChange::Floating {
+                if matches!(
+                    w.change,
+                    WindowChange::Focus | WindowChange::Floating | WindowChange::Move | WindowChange::New
+                ) {
+                    let target_id = w.container.id;
                     
-                    // FIX: Always pull a fresh tree here. This reads the window geometry 
-                    // AFTER Sway recalculates it into the tiling grid, bypassing the race condition.
+                    // Always pull a fresh tree to get post-calculation arrangement metrics
                     if let Ok(tree) = cmd_conn.get_tree() {
-                        if let Some((focused_node, Some(parent))) = get_focused_node_and_parent(&tree, None) {
+                        // FIX: Look up the exact container by ID instead of assuming global focus
+                        if let Some((node, Some(parent))) = find_node_by_id_and_parent(&tree, target_id, None) {
                             
                             // Ultra-fast floating check using native Rust Enum matching (Zero string allocation)
-                            let is_floating = focused_node.node_type == swayipc::NodeType::FloatingCon 
+                            let is_floating = node.node_type == swayipc::NodeType::FloatingCon 
                                 || matches!(
-                                    focused_node.floating,
+                                    node.floating,
                                     Some(Floating::UserOn) | Some(Floating::AutoOn)
                                 );
                             
@@ -39,29 +45,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 NodeLayout::Tabbed | NodeLayout::Stacked
                             );
 
-                            // If we're inside a tabbed or stacked container, don't mess up the layout
                             if is_tabbed_or_stacked {
                                 continue;
                             }
 
-                            // FIX: Use the live rect from the tree loop, NOT the stale w.container.rect
-                            let rect = focused_node.rect;
-                            
-                            // Determine split direction based on current real window dimensions.
-                            let target_cmd = if rect.width > rect.height { "split h" } else { "split v" };
+                            let rect = node.rect;
+                            let split_dir = if rect.width > rect.height { "h" } else { "v" };
 
                             // Check if parent is ALREADY split in our target direction
-                            let already_split_correctly = match target_cmd {
-                                "split h" => parent.layout == NodeLayout::SplitH,
-                                "split v" => parent.layout == NodeLayout::SplitV,
+                            let already_split_correctly = match split_dir {
+                                "h" => parent.layout == NodeLayout::SplitH,
+                                "v" => parent.layout == NodeLayout::SplitV,
                                 _ => false,
                             };
 
-                            // Only send the split command if the parent layout isn't ALREADY 
-                            // split in the target direction. This stops infinite container nesting!
+                            // FIX: Target the window explicitly via its container ID. 
+                            // (Note: The temporary String allocation here is instantly freed via RAII)
                             if !already_split_correctly {
-                                if let Err(e) = cmd_conn.run_command(target_cmd) {
-                                    eprintln!("Failed to execute command '{}': {}", target_cmd, e);
+                                let cmd = format!("[con_id={}] split {}", node.id, split_dir);
+                                if let Err(e) = cmd_conn.run_command(&cmd) {
+                                    eprintln!("Failed to execute command '{}': {}", cmd, e);
                                     break;
                                 }
                             }
@@ -70,7 +73,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Err(e) => {
-                // Log the error and break the loop to prevent the infinite TTY flood when Sway exits.
                 eprintln!("Sway IPC disconnected or encountered an error: {}", e);
                 break;
             }
@@ -82,23 +84,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Recursively find the focused node and its parent in the Sway node tree.
-fn get_focused_node_and_parent<'a>(
+/// FIX: Recursively find a specific node by its ID along with its parent container.
+fn find_node_by_id_and_parent<'a>(
     node: &'a Node,
+    target_id: i64,
     parent: Option<&'a Node>,
 ) -> Option<(&'a Node, Option<&'a Node>)> {
-    if node.focused {
+    if node.id == target_id {
         return Some((node, parent));
     }
     
     for child in &node.nodes {
-        if let Some(res) = get_focused_node_and_parent(child, Some(node)) {
+        if let Some(res) = find_node_by_id_and_parent(child, target_id, Some(node)) {
             return Some(res);
         }
     }
     
     for child in &node.floating_nodes {
-        if let Some(res) = get_focused_node_and_parent(child, Some(node)) {
+        if let Some(res) = find_node_by_id_and_parent(child, target_id, Some(node)) {
             return Some(res);
         }
     }
